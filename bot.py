@@ -1,4 +1,6 @@
 import logging
+import os
+import json
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -9,7 +11,7 @@ from google.oauth2.service_account import Credentials
 from datetime import datetime
 
 # ======= НАСТРОЙКИ =======
-BOT_TOKEN = "8926969111:AAEXGrYSAZPTrXjFaDGt7jKeh3sfevqVAI8"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_НОВЫЙ_ТОКЕН_СЮДА")
 SPREADSHEET_ID = "1LAB1eRocsBXulOqWu0lTJAK13mJdmcD2SEQGOstEfAk"
 
 SCOPES = [
@@ -17,7 +19,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+# Читаем credentials из переменной окружения или файла
+google_creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+if google_creds_json:
+    creds_info = json.loads(google_creds_json)
+    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+else:
+    creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 sheet_fact = spreadsheet.worksheet("Ввод Факт")
