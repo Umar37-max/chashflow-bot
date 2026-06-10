@@ -11,7 +11,7 @@ from google.oauth2.service_account import Credentials
 from datetime import datetime
 
 # ======= НАСТРОЙКИ =======
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_НОВЫЙ_ТОКЕН_СЮДА")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8926969111:AAEXGrYSAZPTrXjFaDGt7jKeh3sfevqVAI8")
 SPREADSHEET_ID = "1LAB1eRocsBXulOqWu0lTJAK13mJdmcD2SEQGOstEfAk"
 
 SCOPES = [
