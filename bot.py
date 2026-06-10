@@ -35,8 +35,10 @@ logging.basicConfig(level=logging.INFO)
 
 # ======= МЕНЮ =======
 MAIN_MENU = ReplyKeyboardMarkup([
-    ["➕ Факт", "📋 Факт просмотр", "✏️ Факт изменить"],
-    ["➕ План", "📋 План просмотр", "✏️ План изменить"],
+    ["➕ Факт", "📋 Факт просмотр"],
+    ["✏️ Факт изменить", "🗑 Факт удалить"],
+    ["➕ План", "📋 План просмотр"],
+    ["✏️ План изменить", "🗑 План удалить"],
 ], resize_keyboard=True)
 
 CANCEL_MENU = ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
@@ -44,6 +46,7 @@ CANCEL_MENU = ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
 # ======= ШАГИ =======
 DATE, TYPE, CATEGORY, AMOUNT, COMMENT = range(5)
 EDIT_DATE, EDIT_SELECT, EDIT_FIELD, EDIT_VALUE = range(10, 14)
+DEL_DATE, DEL_SELECT = range(30, 32)
 VIEW_DATE = 20
 
 # ======= ВСПОМОГАТЕЛЬНЫЕ =======
@@ -373,6 +376,60 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
+
+# ============================================================
+# УДАЛИТЬ
+# ============================================================
+async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    context.user_data["target"] = "fact" if "Факт" in text else "plan"
+    today = datetime.now().strftime("%d.%m.%Y")
+    kb = [[today], ["Другая дата"], ["❌ Отмена"]]
+    await update.message.reply_text(
+        "📅 За какую дату удалить?",
+        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
+    )
+    return DEL_DATE
+
+async def delete_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "❌ Отмена":
+        return await cancel(update, context)
+    if text == "Другая дата":
+        await update.message.reply_text("✏️ Введи дату:", reply_markup=CANCEL_MENU)
+        return DEL_DATE
+    sheet = sheet_fact if context.user_data["target"] == "fact" else sheet_plan
+    rows = get_rows_by_date(sheet, text.strip())
+    if not rows:
+        await update.message.reply_text(f"За {text} записей нет.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
+    context.user_data["del_rows"] = rows
+    kb = [[f"{i}. {r['type']} | {r['category']} | {fmt(r['amount'])}"] for i, r in enumerate(rows, 1)]
+    kb.append(["❌ Отмена"])
+    await update.message.reply_text(
+        "Выбери запись для удаления:",
+        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
+    )
+    return DEL_SELECT
+
+async def delete_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "❌ Отмена":
+        return await cancel(update, context)
+    try:
+        idx = int(text.split(".")[0]) - 1
+        rows = context.user_data["del_rows"]
+        row_info = rows[idx]
+        sheet = sheet_fact if context.user_data["target"] == "fact" else sheet_plan
+        sheet.update(f"A{row_info['row_num']}:E{row_info['row_num']}", [["", "", "", "", ""]])
+        await update.message.reply_text(
+            f"✅ Удалено: {row_info['type']} | {row_info['category']} | {fmt(row_info['amount'])}",
+            reply_markup=MAIN_MENU
+        )
+    except:
+        await update.message.reply_text("⚠️ Выбери из списка!", reply_markup=MAIN_MENU)
+    return ConversationHandler.END
+
 # ============================================================
 # ЗАПУСК
 # ============================================================
@@ -410,10 +467,20 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^❌ Отмена$"), cancel)]
     )
 
+    conv_delete = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^(🗑 Факт удалить|🗑 План удалить)$"), delete_start)],
+        states={
+            DEL_DATE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_date)],
+            DEL_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_select)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^❌ Отмена$"), cancel)]
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_add)
     app.add_handler(conv_view)
     app.add_handler(conv_edit)
+    app.add_handler(conv_delete)
 
     print("🤖 Бот запущен!")
     app.run_polling()
