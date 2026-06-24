@@ -1,8 +1,10 @@
 import logging
 import os
 import json
-import io
+import time
 import asyncio
+import requests
+import fitz  # PyMuPDF — конвертация PDF-экспорта дашборда в PNG (НОВОЕ)
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -10,29 +12,13 @@ from telegram.ext import (
 )
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
-from PIL import Image
-
-# Playwright для скриншотов
-try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-    logging.warning("Playwright не установлен. Скриншоты недоступны.")
+from google.auth.transport.requests import Request as GoogleAuthRequest  # НОВОЕ
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo  # НОВОЕ
 
 # ======= НАСТРОЙКИ =======
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8926969111:AAGoobIK7jj1TSj0LMi3n_PB1_4Qj-shpvE")
 SPREADSHEET_ID = "1LAB1eRocsBXulOqWu0lTJAK13mJdmcD2SEQGOstEfAk"
-
-# Telegram USER ID для авто-отправки скриншотов (замените на свой)
-OWNER_CHAT_ID = os.environ.get("5674083773", "")
-
-# URL дашборда (лист Дашборд)
-DASHBOARD_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit?pli=1#gid=1154"
-
-# Диапазон для скриншота — ячейка B4 (день месяца)
-DAY_CELL = "B4"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -50,9 +36,131 @@ gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 sheet_fact = spreadsheet.worksheet("Ввод Факт")
 sheet_plan = spreadsheet.worksheet("План ввод")
-sheet_dashboard = spreadsheet.worksheet("Дашборд")
+sheet_dashboard = spreadsheet.worksheet("Дашборд")  # НОВОЕ: лист дашборда для скриншотов
 
 logging.basicConfig(level=logging.INFO)
+
+# ============================================================
+# НОВОЕ: НАСТРОЙКИ СКРИНШОТА ДАШБОРДА
+# ============================================================
+DASHBOARD_DAY_CELL = "B4"     # ячейка "Выберите день месяца" (выпадающий список)
+DASHBOARD_DATE_CELL = "B5"    # ячейка "Выбранная дата" (подпись к фото)
+DASHBOARD_RANGE = "A1:O48"    # диапазон скриншота. Поправь, если что-то обрезается/много пустого места
+SCREENSHOT_RECALC_DELAY = 3   # сек. ожидания пересчёта формул/графиков после смены дня
+TASHKENT_TZ = ZoneInfo("Asia/Tashkent")  # часовой пояс для 08:00 / 20:00
+CHAT_ID_FILE = "chat_id.txt"  # сюда сохраняется чат для авто-отправки в 8:00/20:00
+
+
+def save_chat_id(chat_id):
+    """Сохраняем chat_id, чтобы знать, кому слать дашборд в 8:00/20:00."""
+    try:
+        with open(CHAT_ID_FILE, "w") as f:
+            f.write(str(chat_id))
+    except Exception as e:
+        logging.error(f"Не удалось сохранить chat_id: {e}")
+
+
+def load_chat_id():
+    """Берём chat_id либо из переменной окружения ADMIN_CHAT_ID, либо из файла."""
+    env_id = os.environ.get("ADMIN_CHAT_ID")
+    if env_id:
+        return env_id
+    try:
+        with open(CHAT_ID_FILE, "r") as f:
+            val = f.read().strip()
+            return val or None
+    except Exception:
+        return None
+
+
+def parse_day_from_text(text):
+    """
+    Принимает либо просто число дня (например '24'),
+    либо дату вида '24.06.2026' / '24.06', и возвращает день месяца (int) или None.
+    """
+    text = text.strip()
+    if text.isdigit():
+        d = int(text)
+        if 1 <= d <= 31:
+            return d
+        return None
+    try:
+        day_part = text.split(".")[0].strip()
+        d = int(day_part)
+        if 1 <= d <= 31:
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def export_dashboard_png():
+    """
+    Экспортирует диапазон DASHBOARD_RANGE листа 'Дашборд' как PDF через
+    стандартный экспорт Google Таблиц, затем конвертирует первую страницу в PNG.
+    """
+    creds.refresh(GoogleAuthRequest())
+    token = creds.token
+    gid = sheet_dashboard.id
+
+    export_url = (
+        f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export"
+        f"?format=pdf"
+        f"&gid={gid}"
+        f"&range={DASHBOARD_RANGE}"
+        f"&size=A4"
+        f"&portrait=false"
+        f"&fitw=true"
+        f"&gridlines=false"
+        f"&printtitle=false"
+        f"&sheetnames=false"
+        f"&pagenum=UNDEFINED"
+        f"&attachment=false"
+        f"&scale=4"
+        f"&top_margin=0.15&bottom_margin=0.15&left_margin=0.15&right_margin=0.15"
+    )
+
+    resp = requests.get(export_url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("Content-Type", "")
+    if "pdf" not in content_type.lower():
+        raise RuntimeError(
+            "Google не вернул PDF (нет доступа у сервисного аккаунта или истёк токен). "
+            f"Content-Type: {content_type}"
+        )
+
+    pdf_doc = fitz.open(stream=resp.content, filetype="pdf")
+    page = pdf_doc[0]
+    pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))  # x3 для резкости
+    png_bytes = pix.tobytes("png")
+    pdf_doc.close()
+    return png_bytes
+
+
+def make_dashboard_screenshot_sync(day: int):
+    """
+    1) Запоминает текущий день в DASHBOARD_DAY_CELL
+    2) Ставит нужный day
+    3) Ждёт пересчёта формул/графиков
+    4) Делает скриншот (PNG)
+    5) Возвращает день на место (даже если был сбой)
+    Возвращает (png_bytes, выбранная_дата_строка)
+    """
+    old_value = sheet_dashboard.acell(DASHBOARD_DAY_CELL).value
+    try:
+        sheet_dashboard.update_acell(DASHBOARD_DAY_CELL, int(day))
+        time.sleep(SCREENSHOT_RECALC_DELAY)
+        png_bytes = export_dashboard_png()
+        selected_date = sheet_dashboard.acell(DASHBOARD_DATE_CELL).value
+    finally:
+        try:
+            if old_value not in (None, ""):
+                sheet_dashboard.update_acell(DASHBOARD_DAY_CELL, int(old_value))
+        except Exception as restore_err:
+            logging.error(f"Не удалось вернуть дату дашборда на место: {restore_err}")
+    return png_bytes, selected_date
+
 
 # ======= МЕНЮ =======
 MAIN_MENU = ReplyKeyboardMarkup([
@@ -60,7 +168,7 @@ MAIN_MENU = ReplyKeyboardMarkup([
     ["✏️ Факт изменить", "🗑 Факт удалить"],
     ["➕ План", "📋 План просмотр"],
     ["✏️ План изменить", "🗑 План удалить"],
-    ["📸 Скриншот дашборда"],
+    ["📸 Скриншот дашборда"],  # НОВОЕ: кнопка скриншота
 ], resize_keyboard=True)
 
 CANCEL_MENU = ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
@@ -70,7 +178,7 @@ DATE, TYPE, CATEGORY, AMOUNT, COMMENT = range(5)
 EDIT_DATE, EDIT_SELECT, EDIT_FIELD, EDIT_VALUE = range(10, 14)
 DEL_DATE, DEL_SELECT = range(30, 32)
 VIEW_DATE = 20
-SCREENSHOT_DATE = 40
+SCREENSHOT_DATE = 40  # НОВОЕ
 
 # ======= ВСПОМОГАТЕЛЬНЫЕ =======
 def get_categories(sheet):
@@ -129,6 +237,7 @@ def get_all_rows(sheet):
 
 def fmt(val):
     try:
+        # убираем пробелы и запятые из числа
         clean = str(val).replace(" ", "").replace(",", ".")
         return f"{int(float(clean)):,}"
     except:
@@ -140,255 +249,6 @@ def to_num(val):
     except:
         return 0
 
-# ======= СКРИНШОТ ДАШБОРДА =======
-def set_dashboard_day(day: int):
-    """Ставит нужный день в ячейку B4 дашборда"""
-    try:
-        sheet_dashboard.update_cell(4, 2, day)
-        return True
-    except Exception as e:
-        logging.error(f"Ошибка при смене дня в дашборде: {e}")
-        return False
-
-def get_dashboard_day():
-    """Читает текущий день из ячейки B4 дашборда"""
-    try:
-        val = sheet_dashboard.cell(4, 2).value
-        return int(float(str(val))) if val else datetime.now().day
-    except:
-        return datetime.now().day
-
-async def make_dashboard_screenshot(date_str: str) -> bytes | None:
-    """
-    Делает скриншот дашборда для указанной даты.
-    date_str: "24.06.2026"
-    Возвращает bytes PNG или None при ошибке.
-    """
-    if not PLAYWRIGHT_AVAILABLE:
-        return None
-
-    try:
-        # Парсим день из даты
-        day = int(date_str.split(".")[0])
-    except:
-        day = datetime.now().day
-
-    # Читаем текущий день чтобы восстановить потом
-    original_day = get_dashboard_day()
-
-    # Ставим нужный день
-    set_dashboard_day(day)
-    # Ждём пересчёта формул
-    await asyncio.sleep(3)
-
-    screenshot_bytes = None
-
-    try:
-        google_creds_env = os.environ.get("GOOGLE_CREDENTIALS")
-        google_email = None
-        google_password = os.environ.get("GOOGLE_PASSWORD", "")
-
-        if google_creds_env:
-            creds_info_local = json.loads(google_creds_env)
-            # Для логина через браузер нужен обычный Google аккаунт
-            # Используем переменные окружения GOOGLE_EMAIL и GOOGLE_PASSWORD
-            google_email = os.environ.get("GOOGLE_EMAIL", "")
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-            )
-            context = await browser.new_context(
-                viewport={"width": 1600, "height": 900},
-                locale="ru-RU"
-            )
-            page = await context.new_page()
-
-            # Логин в Google если есть email/password
-            if google_email and google_password:
-                await page.goto("https://accounts.google.com/signin")
-                await page.wait_for_load_state("networkidle")
-
-                # Ввод email
-                await page.fill('input[type="email"]', google_email)
-                await page.click('#identifierNext')
-                await page.wait_for_timeout(2000)
-
-                # Ввод пароля
-                await page.fill('input[type="password"]', google_password)
-                await page.click('#passwordNext')
-                await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(3000)
-
-            # Открываем дашборд
-            await page.goto(DASHBOARD_URL, wait_until="networkidle")
-            await page.wait_for_timeout(5000)
-
-            # Ждём загрузки таблицы
-            try:
-                await page.wait_for_selector(".grid-container", timeout=15000)
-            except:
-                await page.wait_for_timeout(5000)
-
-            # Делаем скриншот всей страницы
-            screenshot_bytes = await page.screenshot(
-                full_page=False,
-                clip={
-                    "x": 0,
-                    "y": 0,
-                    "width": 1600,
-                    "height": 900
-                }
-            )
-
-            await browser.close()
-
-    except Exception as e:
-        logging.error(f"Ошибка playwright скриншота: {e}")
-        screenshot_bytes = None
-    finally:
-        # Восстанавливаем оригинальный день
-        await asyncio.sleep(1)
-        set_dashboard_day(original_day)
-
-    return screenshot_bytes
-
-
-async def make_screenshot_via_export(date_str: str) -> bytes | None:
-    """
-    Альтернативный метод: скриншот через Google Sheets Export API.
-    Экспортирует лист Дашборд как PDF/PNG через сервисный аккаунт.
-    """
-    try:
-        day = int(date_str.split(".")[0])
-    except:
-        day = datetime.now().day
-
-    original_day = get_dashboard_day()
-    set_dashboard_day(day)
-    await asyncio.sleep(4)  # Ждём пересчёта
-
-    try:
-        import requests
-        from google.auth.transport.requests import Request
-
-        # Обновляем credentials
-        creds_local = creds
-        if creds_local.expired and creds_local.refresh_token:
-            creds_local.refresh(Request())
-
-        # Получаем gid листа Дашборд
-        try:
-            dashboard_gid = sheet_dashboard.id
-        except:
-            dashboard_gid = 1154  # fallback из URL
-
-        # URL для экспорта листа как PNG
-        export_url = (
-            f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export"
-            f"?format=png"
-            f"&gid={dashboard_gid}"
-            f"&range=A1:N60"  # диапазон дашборда
-            f"&size=A3"
-            f"&portrait=false"
-            f"&fitw=true"
-        )
-
-        headers = {"Authorization": f"Bearer {creds_local.token}"}
-        response = requests.get(export_url, headers=headers, timeout=30)
-
-        if response.status_code == 200:
-            return response.content
-        else:
-            logging.error(f"Export API вернул {response.status_code}: {response.text[:200]}")
-            return None
-
-    except Exception as e:
-        logging.error(f"Ошибка export скриншота: {e}")
-        return None
-    finally:
-        await asyncio.sleep(1)
-        set_dashboard_day(original_day)
-
-
-async def get_dashboard_screenshot(date_str: str) -> bytes | None:
-    """
-    Основная функция получения скриншота.
-    Сначала пробует export API (быстрее), затем Playwright.
-    """
-    # Сначала пробуем быстрый метод через Google Export API
-    img_bytes = await make_screenshot_via_export(date_str)
-    if img_bytes:
-        return img_bytes
-
-    # Если не получилось — пробуем Playwright
-    if PLAYWRIGHT_AVAILABLE:
-        img_bytes = await make_dashboard_screenshot(date_str)
-        if img_bytes:
-            return img_bytes
-
-    return None
-
-
-# ======= АВТО-ОТПРАВКА СКРИНШОТА =======
-async def send_scheduled_screenshot(application):
-    """Отправляет скриншот дашборда владельцу бота"""
-    if not OWNER_CHAT_ID:
-        logging.warning("OWNER_CHAT_ID не задан — авто-скриншот пропущен")
-        return
-
-    today = datetime.now().strftime("%d.%m.%Y")
-    hour = datetime.now().hour
-    time_label = "🌅 Утро" if hour < 12 else "🌆 Вечер"
-
-    await application.bot.send_message(
-        chat_id=OWNER_CHAT_ID,
-        text=f"📊 {time_label} — дашборд за {today}\nГотовлю скриншот..."
-    )
-
-    try:
-        img_bytes = await get_dashboard_screenshot(today)
-        if img_bytes:
-            await application.bot.send_photo(
-                chat_id=OWNER_CHAT_ID,
-                photo=io.BytesIO(img_bytes),
-                caption=f"📊 {time_label} | Финансовый дашборд — {today}"
-            )
-        else:
-            await application.bot.send_message(
-                chat_id=OWNER_CHAT_ID,
-                text="❌ Не удалось сделать скриншот. Проверь настройки."
-            )
-    except Exception as e:
-        logging.error(f"Ошибка авто-отправки скриншота: {e}")
-        await application.bot.send_message(
-            chat_id=OWNER_CHAT_ID,
-            text=f"❌ Ошибка при отправке скриншота: {e}"
-        )
-
-
-def schedule_screenshots(application):
-    """Настраивает расписание авто-скриншотов: 8:00 и 20:00"""
-    job_queue = application.job_queue
-
-    # 8:00 утра
-    job_queue.run_daily(
-        lambda ctx: asyncio.create_task(send_scheduled_screenshot(application)),
-        time=datetime.strptime("08:00", "%H:%M").time(),
-        name="morning_screenshot"
-    )
-
-    # 20:00 вечера
-    job_queue.run_daily(
-        lambda ctx: asyncio.create_task(send_scheduled_screenshot(application)),
-        time=datetime.strptime("20:00", "%H:%M").time(),
-        name="evening_screenshot"
-    )
-
-    logging.info("📅 Авто-скриншоты запланированы на 08:00 и 20:00")
-
-
 # ======= СТАРТ =======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Привет! Выбери действие:", reply_markup=MAIN_MENU)
@@ -397,6 +257,97 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_MENU)
     return ConversationHandler.END
+
+# ============================================================
+# НОВОЕ: ЗАХВАТ CHAT_ID (для автоматической отправки в 8:00/20:00)
+# ============================================================
+async def capture_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Срабатывает на ЛЮБОЕ сообщение в отдельной группе обработчиков (group=-1),
+    поэтому никак не мешает остальным хендлерам и ничего в них не меняет.
+    Просто запоминает, куда слать автоматический дашборд.
+    """
+    if update.effective_chat:
+        save_chat_id(update.effective_chat.id)
+
+# ============================================================
+# НОВОЕ: СКРИНШОТ ДАШБОРДА ПО КНОПКЕ
+# ============================================================
+async def screenshot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y")
+    kb = [[today], ["Другая дата"], ["❌ Отмена"]]
+    await update.message.reply_text(
+        "📅 За какую дату сделать скриншот дашборда?\n"
+        "Можно написать число дня (например 24) или дату (например 24.06.2026).",
+        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
+    )
+    return SCREENSHOT_DATE
+
+async def screenshot_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "❌ Отмена":
+        return await cancel(update, context)
+    if text == "Другая дата":
+        await update.message.reply_text(
+            "✏️ Введи дату (например 24.06.2026) или просто день месяца (например 24):",
+            reply_markup=CANCEL_MENU
+        )
+        return SCREENSHOT_DATE
+
+    day = parse_day_from_text(text)
+    if day is None:
+        await update.message.reply_text(
+            "⚠️ Не понял дату. Введи число дня (1-31) или дату в формате 24.06.2026."
+        )
+        return SCREENSHOT_DATE
+
+    await update.message.reply_text("⏳ Делаю скриншот дашборда, подожди немного...", reply_markup=MAIN_MENU)
+
+    try:
+        loop = asyncio.get_event_loop()
+        png_bytes, selected_date = await loop.run_in_executor(None, make_dashboard_screenshot_sync, day)
+        caption_date = selected_date or text.strip()
+        await update.message.reply_photo(
+            photo=png_bytes,
+            caption=f"📊 Дашборд за {caption_date}",
+            reply_markup=MAIN_MENU
+        )
+    except Exception as e:
+        logging.error(f"Ошибка скриншота дашборда: {e}")
+        await update.message.reply_text(f"❌ Не удалось сделать скриншот: {e}", reply_markup=MAIN_MENU)
+
+    return ConversationHandler.END
+
+# ============================================================
+# НОВОЕ: АВТОМАТИЧЕСКАЯ ОТПРАВКА В 8:00 И 20:00
+# ============================================================
+async def send_daily_dashboard_screenshot(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = load_chat_id()
+    if not chat_id:
+        logging.warning("Нет сохранённого chat_id — пропускаю автоматическую отправку дашборда. "
+                         "Напиши боту /start хотя бы раз, либо задай ADMIN_CHAT_ID.")
+        return
+
+    today_day = datetime.now(TASHKENT_TZ).day
+    try:
+        loop = asyncio.get_event_loop()
+        png_bytes, selected_date = await loop.run_in_executor(None, make_dashboard_screenshot_sync, today_day)
+        now_str = datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y %H:%M")
+        caption_date = selected_date or datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y")
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=png_bytes,
+            caption=f"📊 Дашборд за {caption_date}\n🕒 Автоотправка: {now_str}"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка автоматической отправки дашборда: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Не удалось сделать автоматический скриншот дашборда: {e}"
+            )
+        except Exception:
+            pass
 
 # ============================================================
 # ДОБАВИТЬ
@@ -701,63 +652,6 @@ async def delete_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Выбери из списка!", reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
-
-# ============================================================
-# СКРИНШОТ ДАШБОРДА (по запросу пользователя)
-# ============================================================
-async def screenshot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now().strftime("%d.%m.%Y")
-    kb = [[today], ["Другая дата"], ["❌ Отмена"]]
-    await update.message.reply_text(
-        "📸 За какую дату сделать скриншот дашборда?",
-        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
-    )
-    return SCREENSHOT_DATE
-
-async def screenshot_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "❌ Отмена":
-        return await cancel(update, context)
-
-    if text == "Другая дата":
-        await update.message.reply_text("✏️ Введи дату (01.06.2026):", reply_markup=CANCEL_MENU)
-        return SCREENSHOT_DATE
-
-    date_str = text.strip()
-
-    await update.message.reply_text(
-        f"⏳ Делаю скриншот дашборда за {date_str}...\nЭто займёт несколько секунд.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-    try:
-        img_bytes = await get_dashboard_screenshot(date_str)
-
-        if img_bytes:
-            await update.message.reply_photo(
-                photo=io.BytesIO(img_bytes),
-                caption=f"📊 Финансовый дашборд — {date_str}",
-                reply_markup=MAIN_MENU
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Не удалось сделать скриншот.\n\n"
-                "Проверь что:\n"
-                "• Playwright установлен (`pip install playwright && playwright install chromium`)\n"
-                "• Переменные GOOGLE_EMAIL и GOOGLE_PASSWORD заданы\n"
-                "• Или что у сервисного аккаунта есть доступ к таблице",
-                reply_markup=MAIN_MENU
-            )
-    except Exception as e:
-        logging.error(f"Ошибка скриншота: {e}")
-        await update.message.reply_text(
-            f"❌ Ошибка при создании скриншота: {e}",
-            reply_markup=MAIN_MENU
-        )
-
-    return ConversationHandler.END
-
-
 # ============================================================
 # ЗАПУСК
 # ============================================================
@@ -804,6 +698,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^❌ Отмена$"), cancel)]
     )
 
+    # НОВОЕ: диалог скриншота дашборда по кнопке
     conv_screenshot = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📸 Скриншот дашборда$"), screenshot_start)],
         states={
@@ -812,21 +707,29 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^❌ Отмена$"), cancel)]
     )
 
+    # НОВОЕ: ловим chat_id с любого сообщения в отдельной группе -1,
+    # чтобы это не мешало остальным хендлерам (они в группе 0 по умолчанию)
+    app.add_handler(MessageHandler(filters.ALL, capture_chat_id), group=-1)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_add)
     app.add_handler(conv_view)
     app.add_handler(conv_edit)
     app.add_handler(conv_delete)
-    app.add_handler(conv_screenshot)
+    app.add_handler(conv_screenshot)  # НОВОЕ
 
-    # Авто-скриншоты в 8:00 и 20:00
-    if OWNER_CHAT_ID:
-        schedule_screenshots(app)
-    else:
-        logging.warning(
-            "⚠️ OWNER_CHAT_ID не задан. Авто-скриншоты отключены. "
-            "Задай переменную окружения OWNER_CHAT_ID=ваш_telegram_id"
+    # НОВОЕ: автоматическая отправка дашборда в 8:00 и 20:00 по Ташкенту
+    if app.job_queue is not None:
+        app.job_queue.run_daily(
+            send_daily_dashboard_screenshot,
+            time=dtime(hour=8, minute=0, tzinfo=TASHKENT_TZ)
         )
+        app.job_queue.run_daily(
+            send_daily_dashboard_screenshot,
+            time=dtime(hour=20, minute=0, tzinfo=TASHKENT_TZ)
+        )
+    else:
+        print("⚠️ JobQueue не установлен. Выполни: pip install \"python-telegram-bot[job-queue]\"")
 
     print("🤖 Бот запущен!")
     app.run_polling()
