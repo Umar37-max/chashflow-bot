@@ -36,7 +36,7 @@ gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 sheet_fact = spreadsheet.worksheet("Ввод Факт")
 sheet_plan = spreadsheet.worksheet("План ввод")
-sheet_dashboard = spreadsheet.worksheet("Дашборд")  # НОВОЕ: лист дашборда для скриншотов
+sheet_dashboard = spreadsheet.worksheet("📊 Дашборд")  # НОВОЕ: лист дашборда для скриншотов
 
 logging.basicConfig(level=logging.INFO)
 
