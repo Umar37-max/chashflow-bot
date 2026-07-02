@@ -17,7 +17,7 @@ from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo  # НОВОЕ
 
 # ======= НАСТРОЙКИ =======
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8926969111:AAGoobIK7jj1TSj0LMi3n_PB1_4Qj-shpvE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8926969111:AAErxR7Mwad0VRXUbCZUoFqHRbJPx6QazIQ")
 SPREADSHEET_ID = "1LAB1eRocsBXulOqWu0lTJAK13mJdmcD2SEQGOstEfAk"
 
 SCOPES = [
@@ -729,9 +729,9 @@ def main():
             time=dtime(hour=20, minute=0, tzinfo=TASHKENT_TZ)
         )
     else:
-        print("⚠️ JobQueue не установлен. Выполни: pip install \"python-telegram-bot[job-queue]\"")
+        print("Warning: JobQueue not installed. Run: pip install \"python-telegram-bot[job-queue]\"")
 
-    print("🤖 Бот запущен!")
+    print("Bot started!")
     app.run_polling()
 
 if __name__ == "__main__":
