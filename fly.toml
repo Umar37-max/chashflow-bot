@@ -1,0 +1,14 @@
+# fly.toml app configuration generated for telegram-bot
+
+app = "telegram-bot-24h"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # BOT_TOKEN will be set via 'flyctl secrets set BOT_TOKEN="..."'
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
